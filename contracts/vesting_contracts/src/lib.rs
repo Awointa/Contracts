@@ -13,6 +13,7 @@ const VAULT_DATA: Symbol = Symbol::new(&"VAULT_DATA");
 const USER_VAULTS: Symbol = Symbol::new(&"USER_VAULTS");
 const INITIAL_SUPPLY: Symbol = Symbol::new(&"INITIAL_SUPPLY");
 const ADMIN_BALANCE: Symbol = Symbol::new(&"ADMIN_BALANCE");
+const REQUIRED_SBT_ADDRESS: Symbol = Symbol::new(&"REQUIRED_SBT_ADDRESS");
 
 // Vault structure with lazy initialization
 #[contracttype]
@@ -33,8 +34,27 @@ pub struct BatchCreateData {
     pub end_times: Vec<u64>,
 }
 
+#[contracttype]
+pub struct SplitClaimData {
+    pub vault_id: u64,
+    pub secondary_address: Address,
+    pub split_percentage: u32, // Percentage for secondary address (0-100)
+}
+
 #[contractimpl]
 impl VestingContract {
+    // Helper function to bump storage TTL only if needed (within 30 days of expiration)
+    fn bump_if_needed(env: &Env) {
+        let max_ttl = env.storage().instance().max_ttl();
+        let current_ledger = env.ledger().sequence();
+        
+        // Only bump if we're within 30 days (720*30 ledgers assuming 5s per ledger)
+        let threshold = max_ttl - (720 * 30);
+        
+        if current_ledger >= threshold {
+            env.storage().instance().extend_ttl(max_ttl, max_ttl);
+        }
+    }
     // Initialize contract with initial supply
     pub fn initialize(env: Env, admin: Address, initial_supply: i128) {
         // Set initial supply
@@ -45,6 +65,12 @@ impl VestingContract {
         
         // Initialize vault count
         env.storage().instance().set(&VAULT_COUNT, &0u64);
+    }
+    
+    // Set required SBT address for DID gating
+    pub fn set_required_sbt(env: Env, sbt_address: Address) {
+        Self::bump_if_needed(&env);
+        env.storage().instance().set(&REQUIRED_SBT_ADDRESS, &sbt_address);
     }
     
     // Full initialization - writes all metadata immediately
@@ -157,6 +183,8 @@ impl VestingContract {
     
     // Claim tokens from vault
     pub fn claim_tokens(env: Env, vault_id: u64, claim_amount: i128) -> i128 {
+        Self::bump_if_needed(&env);
+        
         let mut vault: Vault = env.storage().instance()
             .get(&VAULT_DATA, &vault_id)
             .unwrap_or_else(|| {
@@ -166,6 +194,18 @@ impl VestingContract {
         require!(vault.is_initialized, "Vault not initialized");
         require!(claim_amount > 0, "Claim amount must be positive");
         
+        // Check SBT balance for DID gating
+        let required_sbt: Address = env.storage().instance()
+            .get(&REQUIRED_SBT_ADDRESS)
+            .unwrap_or_else(|| {
+                panic!("SBT address not configured");
+            });
+        
+        // Check if beneficiary holds the required SBT
+        let sbt_contract = token::Client::new(&env, &required_sbt);
+        let sbt_balance = sbt_contract.balance(&vault.owner);
+        require!(sbt_balance > 0, "Beneficiary must hold required SBT");
+        
         let available_to_claim = vault.total_amount - vault.released_amount;
         require!(claim_amount <= available_to_claim, "Insufficient tokens to claim");
         
@@ -174,6 +214,48 @@ impl VestingContract {
         env.storage().instance().set(&VAULT_DATA, &vault_id, &vault);
         
         claim_amount
+    }
+    
+    // Claim tokens and split to two addresses
+    pub fn claim_and_split(env: Env, vault_id: u64, secondary_address: Address, split_percentage: u32, claim_amount: i128) -> (i128, i128) {
+        Self::bump_if_needed(&env);
+        
+        let mut vault: Vault = env.storage().instance()
+            .get(&VAULT_DATA, &vault_id)
+            .unwrap_or_else(|| {
+                panic!("Vault not found");
+            });
+        
+        require!(vault.is_initialized, "Vault not initialized");
+        require!(claim_amount > 0, "Claim amount must be positive");
+        require!(split_percentage <= 100, "Split percentage must be 0-100");
+        require!(secondary_address != vault.owner, "Secondary address must be different from primary");
+        
+        // Check SBT balance for DID gating
+        let required_sbt: Address = env.storage().instance()
+            .get(&REQUIRED_SBT_ADDRESS)
+            .unwrap_or_else(|| {
+                panic!("SBT address not configured");
+            });
+        
+        // Check if beneficiary holds the required SBT
+        let sbt_contract = token::Client::new(&env, &required_sbt);
+        let sbt_balance = sbt_contract.balance(&vault.owner);
+        require!(sbt_balance > 0, "Beneficiary must hold required SBT");
+        
+        let available_to_claim = vault.total_amount - vault.released_amount;
+        require!(claim_amount <= available_to_claim, "Insufficient tokens to claim");
+        
+        // Calculate split amounts
+        let secondary_amount = (claim_amount * split_percentage as i128) / 100;
+        let primary_amount = claim_amount - secondary_amount;
+        
+        // Update vault
+        vault.released_amount += claim_amount;
+        env.storage().instance().set(&VAULT_DATA, &vault_id, &vault);
+        
+        // Return the split amounts (primary, secondary)
+        (primary_amount, secondary_amount)
     }
     
     // Batch create vaults with lazy initialization
@@ -260,6 +342,8 @@ impl VestingContract {
     
     // Get vault info (initializes if needed)
     pub fn get_vault(env: Env, vault_id: u64) -> Vault {
+        Self::bump_if_needed(&env);
+        
         let vault: Vault = env.storage().instance()
             .get(&VAULT_DATA, &vault_id)
             .unwrap_or_else(|| {
@@ -285,6 +369,8 @@ impl VestingContract {
     
     // Get user vaults (initializes all if needed)
     pub fn get_user_vaults(env: Env, user: Address) -> Vec<u64> {
+        Self::bump_if_needed(&env);
+        
         let vault_ids: Vec<u64> = env.storage().instance()
             .get(&USER_VAULTS, &user)
             .unwrap_or(Vec::new(&env));
@@ -314,6 +400,8 @@ impl VestingContract {
     
     // Get contract state for invariant checking
     pub fn get_contract_state(env: Env) -> (i128, i128, i128) {
+        Self::bump_if_needed(&env);
+        
         let initial_supply: i128 = env.storage().instance().get(&INITIAL_SUPPLY).unwrap_or(0);
         let admin_balance: i128 = env.storage().instance().get(&ADMIN_BALANCE).unwrap_or(0);
         
@@ -334,6 +422,8 @@ impl VestingContract {
     
     // Check invariant: Total Locked + Total Claimed + Admin Balance = Initial Supply
     pub fn check_invariant(env: Env) -> bool {
+        Self::bump_if_needed(&env);
+        
         let initial_supply: i128 = env.storage().instance().get(&INITIAL_SUPPLY).unwrap_or(0);
         let (total_locked, total_claimed, admin_balance) = Self::get_contract_state(env);
         
